@@ -31,7 +31,7 @@ stats:
   #Delete log after it reaches logmaxsize megabytes
   logmaxsize: 10
   #Run times in cron syntax
-  cron: */30 * * * *
+  cron: '*/30 * * * *'
   #Where to save the collection statistics
   stats_folder: ../stats/
   #Checksum compute frequency. To avoid stressing the file system, checksums are
