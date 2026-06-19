@@ -39,7 +39,7 @@ The the **STAC Items** posted shall follow the following profile:
 | assets[].href | string | **REQUIRED.** Each asset of the STAC Item containing an URI as `href` is ingored and will be posted into the Catalogue as-is. Each asset of the STAC Item containing a local path as `href` is transferred from the stagein area to the main storage area. It shall thus have: An `href` pointing to the relative path of the asset binary file or directory into the S3 stagein bucket associated to the Collection. An `href` filename containing only the [a-zA-Z0-9._-] characters (the rest of the filename path is ignored). The filename shall have maximum 100 characters. An `href` filename unique among all the STAC Item assets (two assets in the same STAC item cannot have the same filename, even if they have different relative paths)  |
 | assets[].type | string | **REQUIRED.** [Media type](https://pystac.readthedocs.io/en/stable/api/media_type.html) of the asset. It is **strongly reommended** to use for raster Cloud-native formats such as **[COG](https://cogeo.org/)** or **[EOPF-Zarr](https://zarr.eopf.copernicus.eu/)** and for vectors formats such as **[FlatGeobuf](https://flatgeobuf.org/)**, **[GeoJSON](https://geojson.org/)** and **[GeoParquet](https://geoparquet.org/)**. See the [common media types](https://github.com/radiantearth/stac-spec/blob/master/best-practices.md#common-media-types-in-stac) for commonly used asset types. |      |
 | assets[].roles | \\[string] | **REQUIRED.** The [semantic roles](#roles) of the asset, similar to the use of `rel` in links. It is **REQUIRED.** to have at least one 'data' or one 'documentation' asset per product. |
-| assets[].file:checksum | string | It is **strongly recommended** to provide the file checksum. The hashes are self-identifying hashes as described in the [Multihash specification](https://github.com/multiformats/multihash) and must be encoded as hexadecimal (base 16) string with lowercase letters. |
+| assets[].file:checksum | string | It is **strongly recommended** to provide the file checksum. The hashes are self-identifying hashes as described in the [Multihash specification](https://github.com/multiformats/multihash), with only sha1, sha2-256 and sha2-512 supported and must be encoded as hexadecimal string with lowercase letters. |
 | assets[].file:size | integer | **REQUIRED.** The file size, specified in bytes. If a local asset is specified, this is checked. |
 
 """,version="0.0.2")
@@ -367,6 +367,23 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
       assets_to_move[staging_asset_path+os.sep]=asset_key
     else:
       return {"id":i['id'],"failure_reason":f"{asset_key} asset {asset['href']} is not a file nor a directory."}
+    #Check if the checksum format is valid (if checksum is specified)
+    if 'file:checksum' in asset:
+      # Must be non-empty and contain only lowercase hex digits.
+      s=asset['file:checksum']
+      if len(s)<2 or (len(s) % 2) or any(c not in "0123456789abcdef" for c in s):
+        return {"id":i['id'],"failure_reason":f"{asset_key} asset {asset['href']} has invalid checksum metadata (not valid lowecase hex string)."}
+      try:
+        mh = bytes.fromhex(s)
+      except ValueError:
+        return {"id":i['id'],"failure_reason":f"{asset_key} asset {asset['href']} has invalid checksum metadata (decoding hex string failed)."}
+      # Check the hash type is supported
+      if mh[0] != 0x11 and mh[0] != 0x12 and mh[0] != 0x13:
+        return {"id":i['id'],"failure_reason":f"{asset_key} asset {asset['href']} has invalid checksum metadata (only hashing algorithms sha1, sha256 and sha512 are supported)."}
+      # Check digest lenght is valid
+      if len(mh)-2 != mh[1]:
+        return {"id":i['id'],"failure_reason":f"{asset_key} asset {asset['href']} has invalid checksum metadata (invalid digest lenght. Should be {mh[1]}, is {len(mh)-2})."}
+
   #Error if we do not have one asset with the role data nor documentation
   if data_is_present == False:
     return {"id":i['id'],"failure_reason":f"At least one asset with role 'data' or 'documentation' is mandatory."}
@@ -423,6 +440,7 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
       return {"id":i['id'],"failure_reason":f"Catalogue refused STAC: {response_status}: {response_text}"}
   except URLError as e:
     response_status='URLError'
+    response_text=str(e)
     return {"id":i['id'],"failure_reason":f"Catalogue refused STAC: {response_status}: {response_text}"}
   except Exception as e:
     response_status='Exception'
