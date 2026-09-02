@@ -3,6 +3,10 @@
 #Basic imports
 import os, sys, json, argparse, tempfile, shutil, datetime, logging, subprocess, re, hashlib
 
+DATETIME_FORMAT = 'YYYY-MM-DDTHH:MM:SSZ'
+DATETIME_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$')
+DATETIME_EXAMPLE = '2024-01-01T00:00:00Z'
+
 #Get commandline input
 parser = argparse.ArgumentParser(prog='Registration API Gateway Client',
                     description='Ingest data into the Registation API Gateway')
@@ -14,7 +18,7 @@ parser.add_argument('-u','--rapi-username', type=str, help='Data Provider Userna
 parser.add_argument('-p','--rapi-password', type=str, help='Data Provider Password. Can be provided via command line or envionment variable [RAPI_PASSWORD]')
 parser.add_argument('-b','--rapi-stagein-bucket', type=str,  help='Data Provider S3 Stagein Bucket to use. Defaults to "sg-<username>-generic" [RAPI_STAGEIN_BUCKET]')
 
-parser.add_argument('--item-datetime', type=str, help='Use the provided string as start_time/end_time for the STAC Item. Format is YYYY-MM-DDTHH:MM:SSZ/YYYY-MM-DDTHH:MM:SSZ . If only one datetime is provided, it will be used as both start_datetime and end_datetime. The STAC Item datetime will be set to the start_date.')
+parser.add_argument('--item-datetime', type=str, help="Set the STAC Item datetime from one RFC 3339 value or a start/end interval separated by '/'. Each value must include a timezone: use 'Z' at the end for UTC or an offset such as '+01:00'. Offsets are converted to UTC. If only one value is provided, it is used for datetime, start_datetime, and end_datetime.")
 parser.add_argument('--item-date-regex', type=str, help='Extract start_time and end_time metadata from the product filename, following the specified regex. Use named groups: sY, sm, sD, sH, sM, sS for start; eY, em, eD, eH, eM, eS for end. If the end_time is not specified from the regex, it will be set to start_time. If only part of the date, e.g. only the year is extracted, the script will try to infer the closest start and end date. For example, if year 2001 is the only value extracted for the start date, start_date will be set to 2001-01-01T00:00:00. The STAC Item datetime will be set to the start_date. As example, if the file name is "Test_20220315_20230103", the regex "Test_(?P<sY>[0-9]{4})" will generate a start_date of 2022-01-01T00:00:00 while "Test_(?P<sY>[0-9]{4})(?P<sm>[0-9]{2})" will generate a start date of 2022-03-01T00:00:00. Note that you can use the "--dry-run -C" switches to check your regular expression is working properly.')
 
 parser.add_argument('--item-ID', type=str, help='Override STAC Item ID. Default is the one provided in the product STAC or the product name without extenstion')
@@ -219,6 +223,18 @@ def asset_upload(src,dst):
     logging.error(f"Error in subcommand execution. {e}. See above")
     return None
   return dst
+def api_failure(stac_item, message):
+  return {"id": stac_item.get('id', 'UNKNOWN'), "failure_reason": message}
+
+def api_error_message(response):
+  if not isinstance(response, dict):
+    return str(response)
+
+  message=response.get('failure_reason') or response.get('detail')
+  if isinstance(message, dict):
+    message=message.get('failure_reason') or message.get('detail') or message
+  return str(message or response)
+
 def ingest_stac(stac_item,collection):
   if args.get('dry_run'):
     logging.info("Dry-run mode enabled. Skipping post of STAC Item")
@@ -232,31 +248,68 @@ def ingest_stac(stac_item,collection):
   with open(stac_item_path,'w') as f:
     json.dump(stac_item,f)
 
-  command=[args['curl_path'],'-X','POST','-T',stac_item_path,'-H','Content-Type: application/json','-u',f"{args['rapi_username']}:{args['rapi_password']}",rapi_ingestion_endpoint]
-  if args['loglevel'] < 0:
-    command+=['-s','-S']
-  elif args['loglevel'] == 0:
-    command.append('-#')
-  elif args['loglevel'] > 1:
+  command=[args['curl_path'],'-s','-S','-X','POST','-T',stac_item_path,'-H','Content-Type: application/json','-u',f"{args['rapi_username']}:{args['rapi_password']}",'-w','\n%{http_code}',rapi_ingestion_endpoint]
+  if args['loglevel'] > 1:
     command.append('-v')
   logging.debug(f'Running {command} with stac "{json.dumps(stac_item)}"')
   try:
-    res=subprocess.run(command,cwd=dtmp.name,check=True,stdout=subprocess.PIPE)
+    res=subprocess.run(command,cwd=dtmp.name,check=False,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
   except Exception as e:
-    logging.error(f"Error in subcommand execution. {e}. See above")
-    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call."}]
+    message=f"Error in reg-api call for item '{stac_item.get('id', 'UNKNOWN')}'. Could not execute curl: {e}"
+    logging.error(message)
+    return api_failure(stac_item, message)
+
+  if res.returncode != 0:
+    stderr=res.stderr.decode('utf-8', errors='replace').strip()
+    message=f"Error in reg-api call for item '{stac_item.get('id', 'UNKNOWN')}'. curl exited with code {res.returncode}."
+    if stderr:
+      message+=f" curl error: {stderr}"
+    logging.error(message)
+    return api_failure(stac_item, message)
+
+  raw_stdout=res.stdout.decode('utf-8', errors='replace')
+  response_body=raw_stdout
+  http_status=None
+  if '\n' in raw_stdout:
+    response_body, possible_status=raw_stdout.rsplit('\n',1)
+    possible_status=possible_status.strip()
+    if possible_status.isdigit():
+      http_status=int(possible_status)
+    else:
+      response_body=raw_stdout
 
   #Try to read the output message (which should be a JSON)
   try:
-    ingested_stac_item=json.loads(res.stdout.decode('utf-8'))
+    ingested_stac_item=json.loads(response_body)
   except Exception as e:
-    logging.error(f"Error in reg-api call. Output is not a JSON")
-    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not a JSON"}]
+    message=f"Error in reg-api call for item '{stac_item.get('id', 'UNKNOWN')}'. Output is not JSON."
+    if http_status:
+      message+=f" HTTP status {http_status}."
+    if response_body.strip():
+      message+=f" Response body: {response_body.strip()}"
+    logging.error(message)
+    return api_failure(stac_item, message)
 
-  #If this is an invalid output (does not contain ID nor failure reason, then it is a failure)
-  if 'id' not in ingested_stac_item:
-    logging.error(f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}")
-    return {"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}"}
+  api_failure_returned=isinstance(ingested_stac_item, dict) and 'failure_reason' in ingested_stac_item
+  if api_failure_returned or (http_status is not None and http_status >= 400):
+    status_text=f" with HTTP status {http_status}" if http_status is not None else ""
+    message=(
+      f"Registration API rejected item '{stac_item.get('id', 'UNKNOWN')}' "
+      f"in collection '{collection}'{status_text}: {api_error_message(ingested_stac_item)}"
+    )
+    logging.error(message)
+    return api_failure(stac_item, message)
+
+  #A successful response must be a JSON object containing the registered Item ID
+  if not isinstance(ingested_stac_item, dict) or 'id' not in ingested_stac_item:
+    status_text=f" HTTP status {http_status}." if http_status is not None else ""
+    message=(
+      f"Registration API returned an unexpected response for item "
+      f"'{stac_item.get('id', 'UNKNOWN')}' in collection '{collection}'.{status_text} "
+      f"Response: {ingested_stac_item}"
+    )
+    logging.error(message)
+    return api_failure(stac_item, message)
 
   return ingested_stac_item
 
@@ -357,15 +410,74 @@ def href_realpath(remotepath,localpath):
     return localpath
   #Use a relative path (but remove the scheme, if any)
   return os.path.abspath('/'+remotepath+'/'+localpath).replace(':/','://',1)[1:]
-  
-def parse_item_datetime(dt_str):
-  # Accepts 'start/end' or single datetime
+
+def normalize_datetime(value, field, item_id='UNKNOWN'):
+  if not isinstance(value, str):
+    return None, None, f"Invalid datetime for item '{item_id}': {field} must be a string in {DATETIME_FORMAT} format."
+
+  if not DATETIME_PATTERN.match(value):
+    return None, None, (
+      f"Invalid datetime for item '{item_id}': {field}='{value}' is not in {DATETIME_FORMAT} format. "
+      f"Use a UTC timestamp with 'T' between date and time and a trailing 'Z', for example {DATETIME_EXAMPLE}."
+    )
+
+  try:
+    iso_value=value[:10]+'T'+value[11:]
+    if iso_value.endswith(('Z', 'z')):
+      iso_value=iso_value[:-1]+'+00:00'
+    parsed=datetime.datetime.fromisoformat(iso_value)
+    parsed_utc=parsed.astimezone(datetime.timezone.utc)
+    normalized=parsed_utc.strftime('%Y-%m-%dT%H:%M:%S')
+    if parsed_utc.microsecond:
+      normalized+=f'.{parsed_utc.microsecond:06d}'.rstrip('0')
+    normalized+='Z'
+    return normalized, parsed_utc, None
+  except (ValueError, OverflowError) as e:
+    return None, None, f"Invalid datetime for item '{item_id}': {field}='{value}' is not a real UTC datetime ({e})."
+
+def normalize_stac_datetimes(stac_item):
+  item_id=stac_item.get('id', 'UNKNOWN')
+  properties=stac_item.get('properties', {})
+  parsed={}
+
+  for field in ['datetime', 'start_datetime', 'end_datetime']:
+    if field not in properties:
+      return f"Invalid datetime for item '{item_id}': properties.{field} is required."
+    normalized, parsed_value, error=normalize_datetime(properties[field], f"properties.{field}", item_id)
+    if error:
+      return error
+    properties[field]=normalized
+    parsed[field]=parsed_value
+
+  if parsed['start_datetime'] > parsed['end_datetime']:
+    return (
+      f"Invalid datetime interval for item '{item_id}': properties.start_datetime "
+      f"must not be later than properties.end_datetime."
+    )
+  return None
+
+def parse_item_datetime(dt_str, item_id='UNKNOWN'):
   if dt_str is None:
-    return None, None
-  if '/' in dt_str:
-    start, end = dt_str.split('/', 1)
-    return start, end
-  return dt_str, dt_str
+    return None, None, None
+
+  parts=dt_str.split('/')
+  if len(parts) > 2:
+    return None, None, (
+      f"Invalid --item-datetime value '{dt_str}'. "
+      f"Use {DATETIME_FORMAT} or {DATETIME_FORMAT}/{DATETIME_FORMAT}."
+    )
+
+  start=parts[0]
+  end=parts[1] if len(parts) == 2 else start
+
+  start, _, error=normalize_datetime(start, 'start datetime', item_id)
+  if error:
+    return None, None, error
+  end, _, error=normalize_datetime(end, 'end datetime', item_id)
+  if error:
+    return None, None, error
+
+  return start, end, None
 
 def extract_datetime_from_filename(product, regex):
   dts = re.compile(regex).search(product)
@@ -557,36 +669,52 @@ def publish_stac(pd):
   elif 'collection' not in stac_item:
     logging.error(f"STAC {pd} has no 'collection' metadata defined in the STAC item. Specify one via the --collection-id parameter!")
     return  [{"id": stac_item['id'], "failure_reason": f'No collection specified'}]
-  # Override datetime from filename regex if requested
-  if 'properties' not in stac_item:
-    stac_item_prop = {}
-  else:
-    stac_item_prop=stac_item['properties']
+  # Setup properties
+  props = stac_item.setdefault('properties', {})
+  if not isinstance(props, dict):
+    error=f"STAC {pd} has invalid 'properties' metadata. It must be a JSON object."
+    logging.error(error)
+    return [api_failure(stac_item, error)]
+
+  # Apply datetime from filename regex if requested
   if args.get('item_date_regex'):
     start_dt, end_dt = extract_datetime_from_filename(product_filename(pd), args['item_date_regex'])
     if start_dt and end_dt:
-      stac_item_prop['start_datetime'] = start_dt
-      stac_item_prop['end_datetime'] = end_dt
-      stac_item_prop['datetime']=start_dt
-      logging.debug(f"Set start_datetime to {start_dt}, end_datetime to {end_dt} and datetime to {start_dt} from filename regex")
-  #Override the STAC items parameters if requested
+      props.update({'start_datetime': start_dt, 'end_datetime': end_dt, 'datetime': start_dt})
+      logging.debug(f"Set datetime fields to {start_dt}/{end_dt} from filename regex")
+
+  # Override with explicit datetime if provided
   if args['item_datetime'] is not None:
-    start_dt, end_dt = parse_item_datetime(args['item_datetime'])
+    start_dt, end_dt, error = parse_item_datetime(args['item_datetime'], stac_item.get('id', 'UNKNOWN'))
+    if error:
+      logging.error(error)
+      return [api_failure(stac_item, error)]
     if start_dt and end_dt:
-      stac_item_prop['start_datetime'] = start_dt
-      stac_item_prop['end_datetime'] = end_dt
-      stac_item_prop['datetime']=start_dt
-      logging.debug(f"Set start_datetime to {start_dt}, end_datetime to {end_dt} and datetime to {start_dt} from input string")
-  #Enforce start and end datetime, following profile
-  if 'datetime' not in stac_item_prop and 'start_datetime' not in stac_item_prop:
-    logging.error(f"STAC {pd} has no 'datetime' nor 'start_datetime' metadata defined in the STAC item. Specify one via the --item-date-regex or --item-datetime parameters!")
-    return  [{"id": stac_item['id'], "failure_reason": f'No collection specified'}]
-  if 'datetime' in stac_item_prop and 'start_datetime' not in stac_item_prop:
-    stac_item_prop['start_datetime'] = stac_item_prop['datetime']
-    logging.debug(f"Set start_datetime to {stac_item_prop['start_datetime']}.")
-  if 'end_datetime' not in stac_item_prop:
-    stac_item_prop['end_datetime'] = stac_item_prop['start_datetime']
-    logging.debug(f"Set end_datetime to {stac_item_prop['start_datetime']}") 
+      props.update({'start_datetime': start_dt, 'end_datetime': end_dt, 'datetime': start_dt})
+      logging.debug(f"Set datetime fields to {start_dt}/{end_dt} from input string")
+
+  # Validate required datetime fields
+  if props.get('datetime') is None and props.get('start_datetime') is None:
+    error = f"STAC {pd} has no 'datetime' nor 'start_datetime' metadata. Specify via --item-date-regex or --item-datetime!"
+    logging.error(error)
+    return [api_failure(stac_item, error)]
+
+  # Ensure all datetime fields are present
+  if props.get('start_datetime') is None:
+    props['start_datetime'] = props['datetime']
+    logging.debug(f"Set start_datetime to {props['start_datetime']}")
+  if props.get('datetime') is None:
+    props['datetime'] = props['start_datetime']
+    logging.debug(f"Set datetime to {props['datetime']}")
+  if props.get('end_datetime') is None:
+    props['end_datetime'] = props['start_datetime']
+    logging.debug(f"Set end_datetime to {props['start_datetime']}")
+
+  # Normalize and validate before stage-in uploads
+  error=normalize_stac_datetimes(stac_item)
+  if error:
+    logging.error(error)
+    return [api_failure(stac_item, error)]
   #Execute changes in the item ID, if requested
   if args['item_ID'] is not None:
     logging.debug(f"Replacing id from {stac_item['id']} to {args['item_ID']}")

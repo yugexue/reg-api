@@ -37,6 +37,36 @@ docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u t
 diff $TMPFILE GeogToWGS84GeoKey5.expected_stac
 [[ $? -ne 0 ]] && error "Checksum and size addition failed"
 
+echo "Check invalid item datetime..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v -C --s5cmd-path /bin/false --curl-path /bin/false -u test -p test -c test --item-datetime '2001-13-01T00:00:00Z' /test_data/GeogToWGS84GeoKey5.no_checksum_no_type > $TMPFILE
+[[ $? -eq 2 ]] || error "Invalid datetime test failed"
+grep -q "Invalid datetime" $TMPFILE
+[[ $? -ne 0 ]] && error "Invalid datetime test failed"
+
+echo "Check datetime timezone is required..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v -C --s5cmd-path /bin/false --curl-path /bin/false -u test -p test -c test --item-datetime '2001-01-01T00:00:00' /test_data/GeogToWGS84GeoKey5.no_checksum_no_type > $TMPFILE
+[[ $? -eq 2 ]] || error "Datetime timezone test failed"
+grep -q "trailing 'Z'" $TMPFILE
+[[ $? -ne 0 ]] && error "Datetime timezone test failed"
+
+echo "Check fractional-seconds datetime..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '2001-01-01T00:00:00.123Z' /test_data/GeogToWGS84GeoKey5.no_checksum_no_type > $TMPFILE
+[[ $? -ne 0 ]] && error "Fractional-seconds datetime test failed"
+grep -q '"datetime": "2001-01-01T00:00:00.123Z"' $TMPFILE
+[[ $? -ne 0 ]] && error "Fractional-seconds datetime test failed"
+
+echo "Check datetime timezone normalization..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '2001-01-01T01:00:00+01:00' /test_data/GeogToWGS84GeoKey5.no_checksum_no_type > $TMPFILE
+[[ $? -ne 0 ]] && error "Datetime timezone normalization test failed"
+grep -q '"datetime": "2001-01-01T00:00:00Z"' $TMPFILE
+[[ $? -ne 0 ]] && error "Datetime timezone normalization test failed"
+
+echo "Check reversed datetime interval..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '2001-01-02T00:00:00Z/2001-01-01T00:00:00Z' /test_data/GeogToWGS84GeoKey5.no_checksum_no_type > $TMPFILE
+[[ $? -eq 2 ]] || error "Reversed datetime interval test failed"
+grep -q "must not be later than properties.end_datetime" $TMPFILE
+[[ $? -ne 0 ]] && error "Reversed datetime interval test failed"
+
 echo "Check item data regex"
 docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-date-regex 'Test_(?P<sY>[0-9]{4})' /test_data/Test_20010205_20230301_data.tif > $TMPFILE
 [[ $? -ne 0 ]] && error "Item data regex test failed"
