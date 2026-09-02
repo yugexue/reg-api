@@ -77,3 +77,4 @@ The input product, whatever STAC Items, STAC Catalogues, STAC Collections or STA
 
 More details about the tool usage is provided in the help, available via the --help switch.
 
+For installation instructions, examples, dry-run checks, and troubleshooting, see the [Registration API Client User Guide](https://eoresults.esa.int/reg_api_client_user_guide.html).
